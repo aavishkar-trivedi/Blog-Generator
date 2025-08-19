@@ -1,125 +1,179 @@
 import os
+import json
+import re
+from flask import Flask, request, jsonify, session
+from flask_cors import CORS
 from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, Process
 import google.generativeai as genai
-import json
-import re
 
-# Load environment variables
+# ------------------------------
+# Load env variables
+# ------------------------------
 load_dotenv()
-
-# --- AGENT DEFINITIONS ---
-
-# Configure the LLM
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    raise ValueError("GEMINI_API_KEY not found in .env file.")
+    raise ValueError("GEMINI_API_KEY not found in .env")
 
 genai.configure(api_key=api_key)
-llm = genai.GenerativeModel('gemini/gemini-1.5-flash')
+# Using the recommended 'gemini-2.0-flash' model for performance
+llm = genai.GenerativeModel('gemini-2.0-flash')
 
-# 1. Researcher Agent
-researcher = Agent(
-  role='Senior Research Analyst',
-  goal='Uncover groundbreaking trends and deep insights about {topic}',
-  backstory="""You are a world-class research analyst, renowned for your ability to distill complex information into a clear, compelling, and structured narrative. 
-  Your primary goal is to create a comprehensive and engaging outline that serves as the perfect blueprint for a viral blog post.""",
-  verbose=True,
-  allow_delegation=False,
-  llm=llm
-)
+# ------------------------------
+# Flask setup
+# ------------------------------
+app = Flask(__name__)
+# A secret key is required for Flask sessions to work
+app.secret_key = os.urandom(24) # Generates a secure, random secret key
+CORS(app, supports_credentials=True) # supports_credentials=True is needed for sessions
 
-# 2. Writer Agent
-writer = Agent(
-  role='Expert Blog Post Writer',
-  goal='Write a viral, engaging, and human-like blog post based on a given outline',
-  backstory="""You are a world-class blog writer, famous for your ability to craft viral content that is both informative and deeply engaging. 
-  You have a knack for storytelling, breaking down complex topics into digestible, bite-sized paragraphs, and maintaining a conversational, human-like tone. 
-  Your writing avoids jargon and clichés, focusing instead on clarity, wit, and originality. You are a master of grammar and spelling.""",
-  verbose=True,
-  allow_delegation=False,
-  llm=llm
-)
-
-# 3. Stylist & Reviewer Agent
-stylist = Agent(
-    role='Content Stylist and Editor',
-    goal='Review a blog post, enhance its formatting, and generate a summary and keywords in a structured JSON format.',
-    backstory="""You are a meticulous editor with a keen eye for detail and style. You ensure every piece of content is perfectly formatted, 
-    engaging, and easy to read. You are an expert in Markdown and creating structured data outputs.""",
+# ------------------------------
+# Agents
+# ------------------------------
+interviewer = Agent(
+    role="Curious Content Planner",
+    goal="Engage the user in a natural Q&A to fully understand their needs before writing.",
+    backstory="""You are like a professional journalist. 
+    You always ask smart, specific, and relevant follow-up questions 
+    until you have enough details to write a high-quality blog.""",
     verbose=True,
     allow_delegation=False,
     llm=llm
 )
 
+researcher = Agent(
+    role="Senior Research Analyst",
+    goal="Uncover deep insights about {topic} using {context}",
+    backstory="""You gather and organize detailed information 
+    into a clear blog outline.""",
+    verbose=True,
+    allow_delegation=False,
+    llm=llm
+)
 
-# --- TASK DEFINITIONS ---
+writer = Agent(
+    role="Expert Blog Writer",
+    goal="Write a compelling blog post based on the research and user details.",
+    backstory="""You craft engaging, structured, and easy-to-read blog posts.""",
+    verbose=True,
+    allow_delegation=False,
+    llm=llm
+)
 
+stylist = Agent(
+    role="Content Stylist and Editor",
+    goal="Format the blog in Markdown, highlight important keywords, and produce a JSON output.",
+    backstory="""You are a detail-oriented editor who outputs a clean JSON 
+    with blogContent, summary, and keywords.""",
+    verbose=True,
+    allow_delegation=False,
+    llm=llm
+)
+
+# ------------------------------
+# Tasks
+# ------------------------------
 research_task = Task(
-  description='Conduct in-depth research on {topic} and create a comprehensive and compelling outline for a blog post. The outline must include an introduction that hooks the reader, at least 5 distinct and interesting sub-topics, and a thought-provoking conclusion.',
-  expected_output='A detailed, multi-level bullet-point outline for a blog post about {topic} that is ready for a writer to expand upon.',
-  agent=researcher
+    description="""Based on the topic "{topic}" and details:
+{context}
+Create a structured outline for the blog.""",
+    expected_output="A bullet-point outline",
+    agent=researcher
 )
 
 write_task = Task(
-  description='Using the provided outline, write a full blog post of 600-800 words. The post should be captivating, easy to read, and feel like it was written by a human. Break down long ideas into smaller, well-structured paragraphs. Ensure the tone is engaging and avoids overly formal language. Check for spelling and grammar errors meticulously.',
-  expected_output='A complete, well-written blog post in plain text, perfectly following the structure and intent of the outline.',
-  agent=writer
+    description="""Using the outline and context:
+{context}
+Write a 600-800 word blog post in plain text.""",
+    expected_output="A full blog post",
+    agent=writer
 )
 
-# --- REFINED TASK ---
 style_task = Task(
-    description="""Review the provided blog post. Your final output MUST be a single, valid JSON object.
-    1.  **Format the Blog Content**: Add Markdown formatting. **Do not add a main title using '#'.** Start the content directly with the first paragraph. Use subheadings (`##`) for different sections. Most importantly, **identify and wrap at least 5-10 of the most important keywords and phrases in bold** using double asterisks (`**word**`). This is crucial for readability.
-    2.  **Summarize**: Write a concise 2-3 sentence summary of the article.
-    3.  **Extract Keywords**: Extract 5-7 relevant keywords as an array of strings.
-    
-    The JSON object must have these exact keys: "blogContent", "summary", "keywords".""",
-    expected_output='A single JSON object containing the formatted blog content (starting with the first paragraph, no main title), a summary, and keywords.',
+    description="""Format the blog in Markdown. 
+Highlight 5-10 important keywords with **bold**. 
+Then return a JSON with blogContent, summary, and keywords.""",
+    expected_output="A valid JSON object",
     agent=stylist
 )
 
-
-# --- CREW DEFINITION ---
-
 blog_crew = Crew(
-  agents=[researcher, writer, stylist],
-  tasks=[research_task, write_task, style_task],
-  verbose=True,
-  process=Process.sequential
+    agents=[researcher, writer, stylist],
+    tasks=[research_task, write_task, style_task],
+    process=Process.sequential,
+    # --- FIX: Disabled memory to prevent ChromaDB/OpenAI dependency error ---
+    memory=False 
 )
 
+# ------------------------------
+# API Routes
+# ------------------------------
+@app.route("/interview", methods=["POST"])
+def interview():
+    data = request.get_json()
+    topic = data.get("topic")
+    user_answer = data.get("answer")
 
-# --- MAIN GENERATOR CLASS ---
+    if "conversation" not in session:
+        session["conversation"] = []
+        session["topic"] = topic
 
-class BlogGenerator:
-    def __init__(self):
-        print("✅ CrewAI Multi-Agent System Initialized")
+    if user_answer:
+        session["conversation"].append({"role": "user", "content": user_answer})
 
-    def generate_blog(self, topic, tone="professional"):
-        """Generates a blog post using a multi-agent crew."""
-        try:
-            print(f"🤖 CrewAI starting job for topic: {topic}")
-            result = blog_crew.kickoff(inputs={'topic': topic})
-            
-            # The raw output should be a string containing the JSON
-            raw_output = result.raw if hasattr(result, 'raw') else str(result)
-            
-            # Clean the string to remove markdown fences around the JSON
-            clean_json_str = re.sub(r'```json\n|\n```', '', raw_output, flags=re.MULTILINE).strip()
-            
-            return json.loads(clean_json_str)
+    convo_text = "\n".join(
+        f"{turn['role'].capitalize()}: {turn['content']}"
+        for turn in session["conversation"]
+    )
 
-        except Exception as e:
-            print(f"🚨 CrewAI Error: {str(e)}")
-            return {
-                "blogContent": f"## An Error Occurred\n\nCould not generate the blog post using the agent crew.\n\n**Error Details:**\n`{str(e)}`",
-                "summary": "Error generating content.",
-                "keywords": ["error"]
-            }
+    prompt = f"""The user wants a blog on: {session['topic']}.
+Conversation so far:
+{convo_text}
 
-if __name__ == '__main__':
-    generator = BlogGenerator()
-    content = generator.generate_blog(topic="The Future of Artificial Intelligence")
-    print("\n\n--- FINAL OUTPUT ---")
-    print(json.dumps(content, indent=2))
+If you still need more details, ask the next question.
+If you have enough details, say: READY TO WRITE and briefly summarize the info gathered."""
+    
+    # Using the llm directly for the interview part
+    response = llm.generate_content(prompt)
+    question = response.text.strip()
+    
+    session["conversation"].append({"role": "agent", "content": question})
+    session.modified = True
+
+    return jsonify({"question": question})
+
+
+@app.route("/generate", methods=["POST"])
+def generate_blog():
+    topic = session.get("topic")
+    conversation = session.get("conversation", [])
+    
+    if not topic:
+        return jsonify({"error": "No topic found in session. Please start the interview process first."}), 400
+
+    extra_context = "\n".join(f"{t['role']}: {t['content']}" for t in conversation)
+
+    try:
+        result = blog_crew.kickoff(inputs={
+            "topic": topic,
+            "context": extra_context
+        })
+        raw_output = result.raw if hasattr(result, "raw") else str(result)
+        # Handle potential markdown code fences around the JSON
+        clean_json = re.sub(r"```json\n|\n```", "", raw_output, flags=re.MULTILINE).strip()
+        data = json.loads(clean_json)
+    except Exception as e:
+        print(f"Error during blog generation: {e}")
+        data = {
+            "blogContent": f"## An Error Occurred\n\nCould not generate the blog post.\n\n**Error Details:**\n`{str(e)}`",
+            "summary": "Error generating blog",
+            "keywords": ["error"]
+        }
+
+    session.clear()
+    return jsonify(data)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Starting Flask server on http://localhost:{port}")
+    app.run(port=port, debug=True)
