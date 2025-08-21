@@ -9,6 +9,12 @@ from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from dotenv import load_dotenv
 import google.generativeai as genai
+from youtube_transcript_api import YouTubeTranscriptApi
+from pytube import YouTube
+import logging
+
+# Import the robust YouTube blog generator
+from youtube_blog_generator import generate_blog_from_youtube
 
 # ------------------------------
 # Flask setup
@@ -658,6 +664,442 @@ class AccuracyResearcher:
                 "content": f"Comprehensive research about {topic} from multiple authoritative sources.",
                 "internal_sources": [],
                 "research_summary": {"total_sources": 0, "note": "No results found"}
+            }
+
+# ------------------------------
+# YouTube Video Processor with Genkit Integration
+# ------------------------------
+class YouTubeVideoProcessor:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
+    
+    def extract_video_id(self, url):
+        """Extract video ID from various YouTube URL formats"""
+        patterns = [
+            r'(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/|m\.youtube\.com\/watch\?v=)([^&\n?#]+)',
+            r'youtube\.com\/watch\?.*v=([^&\n?#]+)',
+            r'youtu\.be\/([^&\n?#]+)'
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, url)
+            if match:
+                return match.group(1)
+        return None
+    
+    def get_video_metadata(self, video_id):
+        """Get video metadata using multiple fallback methods"""
+        # Method 1: Try pytube first
+        try:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            yt = YouTube(video_url)
+            
+            return {
+                'title': yt.title,
+                'description': yt.description,
+                'author': yt.author,
+                'length': yt.length,
+                'views': yt.views,
+                'publish_date': str(yt.publish_date) if yt.publish_date else None,
+                'keywords': yt.keywords if yt.keywords else []
+            }
+        except Exception as e:
+            print(f"⚠️ Pytube failed: {e}")
+            
+        # Method 2: Try web scraping as fallback
+        try:
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            response = self.session.get(video_url)
+            
+            if response.status_code == 200:
+                html_content = response.text
+                
+                # Extract title
+                title_match = re.search(r'"title":"([^"]+)"', html_content)
+                title = title_match.group(1) if title_match else f"YouTube Video {video_id}"
+                
+                # Extract author/channel name
+                author_match = re.search(r'"author":"([^"]+)"', html_content)
+                author = author_match.group(1) if author_match else "Unknown Channel"
+                
+                # Extract length in seconds
+                length_match = re.search(r'"lengthSeconds":"(\d+)"', html_content)
+                length = int(length_match.group(1)) if length_match else 0
+                
+                # Extract view count
+                view_match = re.search(r'"viewCount":"(\d+)"', html_content)
+                views = int(view_match.group(1)) if view_match else 0
+                
+                # Extract description
+                desc_match = re.search(r'"shortDescription":"([^"]*)"', html_content)
+                description = desc_match.group(1)[:500] if desc_match else ""
+                
+                return {
+                    'title': title.encode().decode('unicode_escape'),
+                    'description': description.encode().decode('unicode_escape'),
+                    'author': author.encode().decode('unicode_escape'),
+                    'length': length,
+                    'views': views,
+                    'publish_date': None,
+                    'keywords': []
+                }
+        except Exception as e:
+            print(f"⚠️ Web scraping fallback failed: {e}")
+            
+        # Method 3: Basic fallback with just video ID
+        print("⚠️ Using basic fallback metadata")
+        return {
+            'title': f"YouTube Video {video_id}",
+            'description': "Video description not available",
+            'author': "Unknown Channel",
+            'length': 0,
+            'views': 0,
+            'publish_date': None,
+            'keywords': []
+        }
+    
+    def get_video_transcript(self, video_id):
+        """Get video transcript using YouTube Transcript API"""
+        try:
+            # Try to get transcript in English first
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            
+            # Try to get English transcript
+            try:
+                transcript = transcript_list.find_transcript(['en', 'en-US', 'en-GB'])
+                transcript_data = transcript.fetch()
+            except:
+                # If English not available, get the first available transcript
+                try:
+                    transcript = transcript_list.find_generated_transcript(['en'])
+                    transcript_data = transcript.fetch()
+                except:
+                    # Get any available transcript
+                    transcript = list(transcript_list)[0]
+                    transcript_data = transcript.fetch()
+            
+            # Combine transcript text
+            full_text = ' '.join([entry['text'] for entry in transcript_data])
+            
+            # Clean up the text
+            full_text = re.sub(r'\[.*?\]', '', full_text)  # Remove [Music], [Applause], etc.
+            full_text = re.sub(r'\s+', ' ', full_text).strip()  # Normalize whitespace
+            
+            return {
+                'text': full_text,
+                'language': transcript.language_code,
+                'is_generated': transcript.is_generated,
+                'entries': transcript_data[:10]  # First 10 entries for reference
+            }
+            
+        except Exception as e:
+            print(f"❌ Error getting video transcript: {e}")
+            return None
+    
+    def generate_content_without_transcript(self, video_id, video_url, metadata, additional_context=""):
+        """Generate blog content when transcript is not available using Genkit research"""
+        print("🔍 Generating content without transcript using Genkit research...")
+        
+        try:
+            # Extract key information from metadata
+            title = metadata.get('title', 'Unknown Title')
+            author = metadata.get('author', 'Unknown Author')
+            description = metadata.get('description', '')
+            keywords = metadata.get('keywords', [])
+            
+            # Create search queries based on video metadata
+            search_queries = []
+            
+            # Primary search query from title
+            search_queries.append(title)
+            
+            # Add author-specific search if available
+            if author and author != 'Unknown Author':
+                search_queries.append(f"{author} {title}")
+            
+            # Add keyword-based searches
+            if keywords:
+                top_keywords = keywords[:3]  # Use top 3 keywords
+                search_queries.append(' '.join(top_keywords))
+            
+            # Extract topic from description if available
+            if description:
+                # Use first 100 characters of description for context
+                description_snippet = description[:100].strip()
+                if description_snippet:
+                    search_queries.append(description_snippet)
+            
+            print(f"🔍 Generated {len(search_queries)} search queries for research")
+            
+            # Research the topic using Google Custom Search
+            research_content = []
+            for i, query in enumerate(search_queries[:2]):  # Limit to 2 searches to avoid rate limits
+                print(f"📚 Researching query {i+1}: {query}")
+                try:
+                    search_results = self.search_google(query, num_results=3)
+                    if search_results:
+                        for result in search_results:
+                            research_content.append({
+                                'title': result.get('title', ''),
+                                'snippet': result.get('snippet', ''),
+                                'link': result.get('link', '')
+                            })
+                        print(f"✅ Found {len(search_results)} research sources for query: {query}")
+                    else:
+                        print(f"⚠️ No results found for query: {query}")
+                except Exception as e:
+                    print(f"❌ Error searching for query '{query}': {e}")
+                    continue
+            
+            # Generate blog content using Genkit with research data
+            blog_content = self.generate_blog_with_research(video_id, video_url, metadata, research_content, additional_context)
+            
+            if blog_content:
+                return {
+                    'success': True,
+                    'video_id': video_id,
+                    'video_url': video_url,
+                    'metadata': metadata,
+                    'transcript': None,  # No transcript available
+                    'research_data': research_content,
+                    'blog_content': blog_content,
+                    'content_summary': {
+                        'title': metadata['title'],
+                        'author': metadata['author'],
+                        'duration_minutes': round(metadata['length'] / 60, 1) if metadata['length'] > 0 else 'Unknown',
+                        'has_transcript': False,
+                        'research_sources': len(research_content),
+                        'generation_method': 'Metadata + Research + Genkit'
+                    }
+                }
+            else:
+                return {
+                    'error': 'Failed to generate blog content using research method',
+                    'success': False,
+                    'metadata': metadata
+                }
+                
+        except Exception as e:
+            print(f"❌ Error in generate_content_without_transcript: {e}")
+            return {
+                'error': f'Error generating content without transcript: {str(e)}',
+                'success': False,
+                'metadata': metadata
+            }
+    
+    def generate_blog_with_research(self, video_id, video_url, metadata, research_content, additional_context=""):
+        """Generate blog using video metadata and research data with Genkit"""
+        try:
+            # Prepare research context
+            research_text = ""
+            if research_content:
+                research_text = "\n\n**Research Sources:**\n"
+                for i, source in enumerate(research_content, 1):
+                    research_text += f"\n{i}. **{source['title']}**\n"
+                    research_text += f"   {source['snippet']}\n"
+                    research_text += f"   Source: {source['link']}\n"
+            
+            # Prepare metadata context
+            duration_text = f"{round(metadata['length'] / 60, 1)} minutes" if metadata['length'] > 0 else "Duration unknown"
+            keywords_text = ', '.join(metadata.get('keywords', [])[:10]) if metadata.get('keywords') else "No keywords available"
+            description_text = metadata.get('description', '')[:500] if metadata.get('description') else "No description available"
+            
+            prompt = f"""
+            Create a comprehensive, well-researched blog post about the following YouTube video. Since the video transcript is not available, use the video metadata and research sources to create engaging content.
+
+            **Video Information:**
+            - Title: {metadata['title']}
+            - Author/Channel: {metadata['author']}
+            - Duration: {duration_text}
+            - Keywords: {keywords_text}
+            - Video URL: {video_url}
+
+            **Video Description:**
+            {description_text}
+
+            {research_text}
+
+            **Additional Context (if provided):**
+            {additional_context}
+
+            **Content Generation Instructions:**
+            1. Create a compelling blog title based on the video title and research
+            2. Write an engaging introduction that explains what the video likely covers
+            3. Use the research sources to provide comprehensive coverage of the topic
+            4. Structure content with clear headings and subheadings
+            5. Include insights and analysis based on the research
+            6. Provide practical takeaways and actionable advice
+            7. Write a strong conclusion that summarizes key points
+            8. Keep the tone professional yet engaging
+            9. Aim for 1200-1800 words
+            10. Make it SEO-friendly with good keyword usage
+
+            **Important Notes:**
+            - Acknowledge that this content is based on research about the video topic
+            - Don't claim to have watched the video or quote specific video content
+            - Focus on providing value around the video's topic using the research
+            - Include references to the video as a recommended resource
+
+            **Format Requirements:**
+            - Use clear headings (##) and subheadings (###)
+            - Include bullet points where appropriate
+            - Make paragraphs well-structured and readable
+            - Include a "Key Takeaways" section
+            - Add a reference to the original video
+
+            Generate the comprehensive blog post now:
+            """
+
+            # Generate blog using Gemini
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                print("✅ Successfully generated blog content using research method")
+                return response.text
+            else:
+                print("❌ Failed to generate blog content - empty response from Gemini")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error generating blog with research: {e}")
+            return None
+    
+    def process_youtube_video(self, video_url, additional_context=""):
+        """Main method to process YouTube video and extract all information"""
+        print(f"🎥 Processing YouTube video: {video_url}")
+        
+        # Extract video ID
+        video_id = self.extract_video_id(video_url)
+        if not video_id:
+            return {
+                'error': 'Invalid YouTube URL',
+                'success': False
+            }
+        
+        print(f"📺 Video ID: {video_id}")
+        
+        # Get video metadata - now always returns something
+        metadata = self.get_video_metadata(video_id)
+        
+        print(f"📝 Video Title: {metadata['title']}")
+        print(f"👤 Author: {metadata['author']}")
+        print(f"⏱️ Duration: {metadata['length']} seconds")
+        
+        # Try to get video transcript
+        transcript = self.get_video_transcript(video_id)
+        if not transcript:
+            print("⚠️ No transcript available - will generate content based on metadata and research")
+            # Use Genkit to research and generate content based on video metadata
+            return self.generate_content_without_transcript(video_id, video_url, metadata, additional_context)
+        
+        print(f"📄 Transcript length: {len(transcript['text'])} characters")
+        print(f"🌐 Transcript language: {transcript['language']}")
+        
+        return {
+            'success': True,
+            'video_id': video_id,
+            'video_url': video_url,
+            'metadata': metadata,
+            'transcript': transcript,
+            'content_summary': {
+                'title': metadata['title'],
+                'author': metadata['author'],
+                'duration_minutes': round(metadata['length'] / 60, 1) if metadata['length'] > 0 else 'Unknown',
+                'transcript_words': len(transcript['text'].split()),
+                'has_transcript': True,
+                'language': transcript['language']
+            }
+        }
+    
+    def generate_blog_from_video(self, video_data, additional_context=""):
+        """Generate blog content from video data using Gemini"""
+        if not video_data.get('success'):
+            return None
+        
+        metadata = video_data['metadata']
+        transcript = video_data['transcript']
+        
+        # Prepare the prompt for Gemini
+        duration_text = f"{round(metadata['length'] / 60, 1)} minutes" if metadata['length'] > 0 else "Duration unknown"
+        views_text = f"{metadata.get('views', 'N/A')}" if metadata.get('views') else "Views not available"
+        keywords_text = ', '.join(metadata.get('keywords', [])[:10]) if metadata.get('keywords') else "No keywords available"
+        description_text = metadata.get('description', '')[:500] if metadata.get('description') else "No description available"
+        
+        prompt = f"""
+        Create a comprehensive, well-structured blog post based on the following YouTube video content:
+
+        **Video Information:**
+        - Title: {metadata['title']}
+        - Author/Channel: {metadata['author']}
+        - Duration: {duration_text}
+        - Views: {views_text}
+        - Keywords: {keywords_text}
+
+        **Video Description:**
+        {description_text}
+
+        **Full Video Transcript:**
+        {transcript['text']}
+
+        **Additional Context (if provided):**
+        {additional_context}
+
+        **Instructions:**
+        1. Create a compelling blog title that captures the main topic
+        2. Write an engaging introduction that hooks the reader
+        3. Structure the content with clear headings and subheadings
+        4. Extract and expand on the key points from the video
+        5. Include relevant examples, insights, and takeaways
+        6. Add a strong conclusion with actionable points
+        7. Keep the tone professional yet engaging
+        8. Aim for 1000-1500 words
+        9. Make it SEO-friendly with good keyword usage
+
+        **Format the blog as follows:**
+        - Use clear headings and subheadings
+        - Include bullet points where appropriate
+        - Make paragraphs well-structured and readable
+        - Include a summary section at the end
+
+        Generate the blog post now:
+        """
+
+        try:
+            # Generate blog using Gemini
+            model = genai.GenerativeModel('gemini-2.0-flash-exp')
+            response = model.generate_content(prompt)
+            
+            if response and response.text:
+                return {
+                    'success': True,
+                    'blog_content': response.text,
+                    'source_video': {
+                        'title': metadata['title'],
+                        'author': metadata['author'],
+                        'url': video_data['video_url'],
+                        'duration': round(metadata['length'] / 60, 1)
+                    },
+                    'generation_info': {
+                        'method': 'YouTube Video + Gemini 2.0 Flash',
+                        'transcript_length': len(transcript['text']),
+                        'has_captions': True
+                    }
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': 'Failed to generate blog content'
+                }
+                
+        except Exception as e:
+            print(f"❌ Error generating blog from video: {e}")
+            return {
+                'success': False,
+                'error': f'Blog generation failed: {str(e)}'
             }
 
 # ------------------------------
@@ -1317,6 +1759,111 @@ Target length: 1000-1200 words with proper structure, formatting, and research-b
             "blogContent": f"# Error\n\nError generating blog: {str(e)}",
             "summary": "Error generating blog",
             "keywords": ["error"]
+        }), 500
+
+
+@app.route("/youtube-generate", methods=["POST"])
+def youtube_generate():
+    """
+    Robust YouTube blog generation endpoint using the new robust function
+    Handles all edge cases and always returns a proper response
+    """
+    try:
+        # Get request data
+        data = request.json if request.json else {}
+        youtube_url = data.get("youtubeUrl", "").strip()
+        additional_context = data.get("additionalContext", "").strip()
+        
+        # Validate input
+        if not youtube_url:
+            return jsonify({
+                "success": False,
+                "error": "YouTube URL is required",
+                "blogContent": None
+            }), 400
+        
+        print(f"🎥 Processing YouTube video: {youtube_url}")
+        
+        # Get API keys from existing configuration
+        google_search_api_key = "AIzaSyBulaFMZql3n6-mtJnHF55371CYtJu_9R8"  # Using your existing key
+        search_engine_ids = [
+            "a65b8e8b1cf564e44",
+            "91e458efa2c6a4c49", 
+            "507e20da4ca5248b6"
+        ]
+        
+        # Call the robust blog generation function
+        result = generate_blog_from_youtube(
+            video_url=youtube_url,
+            additional_context=additional_context,
+            gemini_api_key=api_key,  # Use existing configured API key
+            google_search_api_key=google_search_api_key,
+            search_engine_id=search_engine_ids[0]  # Use first search engine
+        )
+        
+        # Check if generation was successful
+        if result['success']:
+            # Success case - format response to match existing frontend expectations
+            response_data = {
+                "success": True,
+                "blogContent": result['blog_content'],
+                "summary": f"Blog generated from YouTube video: '{result['video_info']['title']}' by {result['video_info']['author']}",
+                "keywords": [],  # Extract from metadata if available
+                "source": {
+                    "type": "YouTube Video",
+                    "title": result['video_info']['title'],
+                    "author": result['video_info']['author'],
+                    "url": youtube_url,
+                    "duration": f"{result['video_info']['duration_minutes']} minutes",
+                    "views": result['video_info']['views'],
+                    "transcript_available": result['generation_info']['transcript_available'],
+                    "generation_method": result['generation_info']['method']
+                },
+                "generation_info": result['generation_info'],
+                "metadata": {
+                    "generated_at": result['timestamp'],
+                    "method": result['generation_info']['method'],
+                    "research_sources": result['generation_info'].get('research_sources', 0)
+                }
+            }
+            
+            # Save the blog to file (maintaining compatibility with existing code)
+            try:
+                with open("latest_youtube_blog.md", "w", encoding="utf-8") as f:
+                    f.write(f"# {result['video_info']['title']}\n\n")
+                    f.write(f"**Source:** YouTube Video by {result['video_info']['author']}\n")
+                    f.write(f"**URL:** {youtube_url}\n")
+                    f.write(f"**Duration:** {result['video_info']['duration_minutes']} minutes\n")
+                    f.write(f"**Generation Method:** {result['generation_info']['method']}\n\n")
+                    f.write("---\n\n")
+                    f.write(result['blog_content'])
+                print("💾 Blog saved to latest_youtube_blog.md")
+            except Exception as save_error:
+                print(f"⚠️ Warning: Could not save blog to file: {save_error}")
+            
+            print(f"✅ Blog generated successfully using {result['generation_info']['method']}")
+            return jsonify(response_data), 200
+            
+        else:
+            # Error case - but still return structured response
+            error_response = {
+                "success": False,
+                "error": result['error'],
+                "blogContent": None,
+                "video_info": result.get('video_info', {}),
+                "timestamp": result['timestamp']
+            }
+            
+            print(f"❌ Blog generation failed: {result['error']}")
+            return jsonify(error_response), 400
+    
+    except Exception as e:
+        # Ultimate fallback for any unexpected errors
+        print(f"❌ Unexpected error in YouTube endpoint: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Server error: {str(e)}",
+            "blogContent": None
         }), 500
 
 

@@ -10,6 +10,9 @@ export default function QABlogUI() {
   const [blogResult, setBlogResult] = useState(null);
   const [isReadyToWrite, setIsReadyToWrite] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [youtubeUrl, setYoutubeUrl] = useState("");
+  const [additionalContext, setAdditionalContext] = useState("");
+  const [activeTab, setActiveTab] = useState("topic"); // "topic" or "youtube"
   const blogContentRef = useRef(null);
 
   // Add CSS for animations
@@ -93,12 +96,41 @@ export default function QABlogUI() {
     setLoading(false);
   };
 
+  const generateFromYoutube = async () => {
+    if (!youtubeUrl.trim()) return alert("Please enter a YouTube URL!");
+    
+    // Basic YouTube URL validation
+    const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/)/;
+    if (!youtubeRegex.test(youtubeUrl)) {
+      return alert("Please enter a valid YouTube URL!");
+    }
+    
+    setLoading(true);
+    setBlogResult(null);
+    setConversation([]);
+    
+    try {
+      const res = await axios.post("http://localhost:3001/youtube-generate", {
+        youtubeUrl: youtubeUrl,
+        additionalContext: additionalContext
+      });
+      setBlogResult(res.data);
+    } catch (error) {
+      const errorMessage = error.response?.data?.error || "Error generating blog from YouTube video. Please try again.";
+      alert(errorMessage);
+    }
+    setLoading(false);
+  };
+
   const resetAll = () => {
     setTopic("");
     setConversation([]);
     setUserInput("");
     setBlogResult(null);
     setIsReadyToWrite(false);
+    setYoutubeUrl("");
+    setAdditionalContext("");
+    setActiveTab("topic");
   };
 
   // Format blog content in simple, clean blog format like real-world blogs
@@ -272,7 +304,7 @@ export default function QABlogUI() {
     return result;
   };
 
-  // Download as PDF with better formatting
+  // Download as PDF with same formatting as UI
   const downloadPDF = () => {
     if (!blogResult || !blogResult.blogContent) return;
     
@@ -288,64 +320,145 @@ export default function QABlogUI() {
     const margin = 20;
     let yPosition = margin;
     
-    // Helper function to add text with word wrapping
-    const addText = (text, fontSize, fontStyle = 'normal', color = [0, 0, 0]) => {
+    // Helper function to add text with word wrapping and proper spacing
+    const addText = (text, fontSize, fontStyle = 'normal', color = [0, 0, 0], isTitle = false, isHeading = false) => {
+      // Check if we need a new page
+      const estimatedHeight = fontSize * 1.2;
+      if (yPosition + estimatedHeight > pageHeight - margin) {
+        doc.addPage();
+        yPosition = margin;
+      }
+      
       doc.setFontSize(fontSize);
       doc.setFont(undefined, fontStyle);
       doc.setTextColor(...color);
       
       const lines = doc.splitTextToSize(text, pageWidth - 2 * margin);
       
-      lines.forEach(line => {
-        if (yPosition > pageHeight - margin) {
-          doc.addPage();
-          yPosition = margin;
+      // Add title spacing and centering
+      if (isTitle) {
+        yPosition += 10; // Extra space before title
+        lines.forEach(line => {
+          const textWidth = doc.getTextWidth(line);
+          const x = (pageWidth - textWidth) / 2; // Center the text
+          doc.text(line, x, yPosition);
+          yPosition += fontSize * 0.6;
+        });
+        // Add underline for title
+        const titleWidth = doc.getTextWidth(lines[0]);
+        const titleX = (pageWidth - titleWidth) / 2;
+        doc.setLineWidth(0.5);
+        doc.line(titleX, yPosition + 2, titleX + titleWidth, yPosition + 2);
+        yPosition += 8;
+      } else {
+        lines.forEach(line => {
+          if (yPosition > pageHeight - margin) {
+            doc.addPage();
+            yPosition = margin;
+          }
+          doc.text(line, margin, yPosition);
+          yPosition += fontSize * 0.6;
+        });
+        
+        // Add spacing after sections
+        if (isHeading) {
+          yPosition += 5;
+        } else {
+          yPosition += 4;
         }
-        doc.text(line, margin, yPosition);
-        yPosition += fontSize * 0.5;
-      });
-      
-      yPosition += 3; // Add some spacing after text
+      }
     };
-    
-    // Clean content for PDF (remove HTML and markdown)
-    const cleanContent = blogResult.blogContent
-      .replace(/<[^>]*>/g, '') // Remove HTML tags
-      .replace(/\*{1,}/g, '') // Remove asterisks
-      .replace(/#{1,}/g, '') // Remove hash symbols
+
+    // Process content using same logic as UI formatBlogContent
+    let cleanContent = blogResult.blogContent
+      .replace(/\\n/g, '\n') // Convert escaped \n to actual newlines
+      .replace(/\n{3,}/g, '\n\n') // Normalize multiple line breaks
+      .replace(/#{1,6}\s*/g, '') // Remove markdown # symbols
+      .replace(/\*{2,}/g, '') // Remove ** and ***
+      .replace(/`{1,3}[^`]*`{1,3}/g, '') // Remove code blocks
+      .replace(/```[^`]*```/g, '') // Remove code fences
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // Convert links to text
+      .replace(/<[^>]*>/g, '') // Remove any HTML tags
       .trim();
+
+    // Split into sections based on double line breaks
+    const sections = cleanContent.split(/\n\s*\n/).filter(section => section.trim());
     
-    // Split content into sections
-    const sections = cleanContent.split(/\n\s*\n/);
+    let titleFound = false;
     
-    sections.forEach(section => {
+    sections.forEach((section, index) => {
       section = section.trim();
       if (!section) return;
       
-      // Check if it's a heading (starts with original heading text pattern)
-      if (section.length < 100 && !section.includes('.') && !section.includes(',')) {
-        // Likely a heading
-        addText(section, 16, 'bold', [44, 62, 80]);
-        yPosition += 3;
+      // Apply same logic as UI formatting
+      const words = section.split(' ').length;
+      const endsWithPeriod = section.endsWith('.');
+      const isShortLine = words <= 15;
+      const isVeryShortLine = words <= 8;
+      const startsWithNumber = /^\d+\./.test(section);
+      const startsWithBullet = /^[-•*]/.test(section);
+      const isQuestionOrTitle = section.includes('?') || (!titleFound && isVeryShortLine && !endsWithPeriod);
+      
+      // Clean text for PDF (remove HTML tags that might be left)
+      const cleanText = section.replace(/<[^>]*>/g, '').replace(/&[^;]+;/g, '');
+      
+      if (!titleFound && (isQuestionOrTitle || (index === 0 && isShortLine))) {
+        // Main blog title
+        titleFound = true;
+        addText(cleanText, 18, 'bold', [26, 32, 44], true, false);
+      } else if (isShortLine && !endsWithPeriod && !startsWithBullet && !startsWithNumber) {
+        // Section heading
+        addText(cleanText, 14, 'bold', [52, 73, 94], false, true);
+      } else if (startsWithBullet || startsWithNumber || section.includes('\n•') || section.includes('\n-')) {
+        // Handle lists
+        const lines = section.split('\n').filter(line => line.trim());
+        
+        lines.forEach(line => {
+          line = line.trim();
+          if (line && (line.startsWith('•') || line.startsWith('-') || line.startsWith('*') || /^\d+\./.test(line))) {
+            // Remove bullet/number prefix and add custom bullet
+            const cleanLine = line.replace(/^[-•*]\s*/, '').replace(/^\d+\.\s*/, '');
+            addText(`• ${cleanLine}`, 11, 'normal', [44, 62, 80]);
+          } else if (line) {
+            // Regular line within list context
+            addText(`  ${line}`, 11, 'normal', [44, 62, 80]);
+          }
+        });
       } else {
-        // Regular content
-        addText(section, 11, 'normal', [44, 62, 80]);
-        yPosition += 5;
+        // Regular paragraph
+        const lines = section.split('\n').filter(line => line.trim());
+        const paragraphContent = lines.join(' ');
+        addText(paragraphContent, 11, 'normal', [44, 62, 80]);
       }
     });
     
-    // Add summary at the end
-    if (blogResult.summary) {
+    // Add footer with generation info
+    if (blogResult.summary || blogResult.keywords) {
+      yPosition += 15;
+      
+      // Add a separator line
+      doc.setLineWidth(0.3);
+      doc.line(margin, yPosition, pageWidth - margin, yPosition);
       yPosition += 10;
-      addText('Summary', 14, 'bold', [52, 152, 219]);
-      addText(blogResult.summary, 10, 'normal', [127, 140, 141]);
+      
+      if (blogResult.summary) {
+        addText('Summary', 13, 'bold', [41, 128, 185], false, true);
+        addText(blogResult.summary, 10, 'normal', [127, 140, 141]);
+      }
+      
+      if (blogResult.keywords && blogResult.keywords.length > 0) {
+        addText('Keywords', 13, 'bold', [41, 128, 185], false, true);
+        addText(blogResult.keywords.join(', '), 10, 'italic', [127, 140, 141]);
+      }
     }
     
-    // Add keywords
-    if (blogResult.keywords && blogResult.keywords.length > 0) {
-      yPosition += 10;
-      addText('Keywords', 14, 'bold', [52, 152, 219]);
-      addText(blogResult.keywords.join(', '), 10, 'normal', [127, 140, 141]);
+    // Add page numbers
+    const pageCount = doc.internal.getNumberOfPages();
+    for (let i = 1; i <= pageCount; i++) {
+      doc.setPage(i);
+      doc.setFontSize(8);
+      doc.setTextColor(127, 140, 141);
+      doc.text(`Page ${i} of ${pageCount}`, pageWidth - margin - 15, pageHeight - 10);
     }
     
     doc.save(`${topic.replace(/\s+/g, '-').toLowerCase()}.pdf`);
@@ -421,50 +534,97 @@ export default function QABlogUI() {
           border: "1px solid #e1e8ed",
           marginBottom: "30px"
         }}>
-          <h3 style={{ 
-            fontSize: "18px", 
-            fontWeight: "600", 
-            color: "#1a202c", 
-            marginTop: "0",
-            marginBottom: "20px",
+          {/* Tab Navigation */}
+          <div style={{
             display: "flex",
-            alignItems: "center",
-            gap: "8px"
+            marginBottom: "25px",
+            borderBottom: "2px solid #f1f3f4"
           }}>
-            <span>💡</span> What would you like to write about?
-          </h3>
-          <input
-            type="text"
-            placeholder="Enter your blog topic (e.g., Artificial Intelligence, Healthy Living, etc.)"
-            value={topic}
-            onChange={(e) => setTopic(e.target.value)}
-            style={{ 
-              width: "100%", 
-              padding: "15px", 
-              marginBottom: "20px", 
-              border: "2px solid #e2e8f0",
-              borderRadius: "10px",
-              fontSize: "16px",
-              fontFamily: "inherit",
-              outline: "none",
-              transition: "border-color 0.2s ease",
-              backgroundColor: "#fafbfc"
-            }}
-            onFocus={(e) => e.target.style.borderColor = "#667eea"}
-            onBlur={(e) => e.target.style.borderColor = "#e2e8f0"}
-          />
-          
-          <div style={{ display: "flex", gap: "15px", flexWrap: "wrap" }}>
-            <button 
-              onClick={startInterview} 
-              disabled={loading || !topic.trim()}
+            <button
+              onClick={() => setActiveTab("topic")}
               style={{
                 flex: "1",
-                minWidth: "200px",
-                padding: "15px 20px",
-                background: topic.trim() && !loading 
-                  ? "linear-gradient(135deg, #667eea 0%, #764ba2 100%)" 
-                  : "#94a3b8",
+                padding: "12px 20px",
+                border: "none",
+                background: activeTab === "topic" ? "linear-gradient(135deg, #667eea 0%, #764ba2 100%)" : "transparent",
+                color: activeTab === "topic" ? "white" : "#64748b",
+                fontSize: "16px",
+                fontWeight: "600",
+                borderRadius: "8px 8px 0 0",
+                cursor: "pointer",
+                transition: "all 0.3s ease",
+                borderBottom: activeTab === "topic" ? "3px solid #667eea" : "3px solid transparent"
+              }}
+            >
+              📝 Topic Blog
+            </button>
+            <button
+              onClick={() => setActiveTab("youtube")}
+              style={{
+                flex: "1",
+                padding: "12px 20px",
+                border: "none",
+                background: activeTab === "youtube" ? "linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%)" : "transparent",
+                color: activeTab === "youtube" ? "white" : "#64748b",
+                fontSize: "16px",
+                fontWeight: "600",
+                borderRadius: "8px 8px 0 0",
+                cursor: "pointer",
+                transition: "all 0.3s ease",
+                borderBottom: activeTab === "youtube" ? "3px solid #ff416c" : "3px solid transparent"
+              }}
+            >
+              🎥 YouTube Blog
+            </button>
+          </div>
+
+          {/* Topic Tab Content */}
+          {activeTab === "topic" && (
+            <div>
+              <h3 style={{ 
+                fontSize: "18px", 
+                fontWeight: "600", 
+                color: "#1a202c", 
+                marginTop: "0",
+                marginBottom: "20px",
+                display: "flex",
+                alignItems: "center",
+                gap: "8px"
+              }}>
+                <span>💡</span> What would you like to write about?
+              </h3>
+              <input
+                type="text"
+                placeholder="Enter your blog topic (e.g., Artificial Intelligence, Healthy Living, etc.)"
+                value={topic}
+                onChange={(e) => setTopic(e.target.value)}
+                style={{ 
+                  width: "100%", 
+                  padding: "15px", 
+                  marginBottom: "20px", 
+                  border: "2px solid #e2e8f0",
+                  borderRadius: "10px",
+                  fontSize: "16px",
+                  fontFamily: "inherit",
+                  outline: "none",
+                  transition: "border-color 0.2s ease",
+                  backgroundColor: "#fafbfc"
+                }}
+                onFocus={(e) => e.target.style.borderColor = "#667eea"}
+                onBlur={(e) => e.target.style.borderColor = "#e2e8f0"}
+              />
+              
+              <div style={{ display: "flex", gap: "15px", flexWrap: "wrap" }}>
+                <button 
+                  onClick={startInterview} 
+                  disabled={loading || !topic.trim()}
+                  style={{
+                    flex: "1",
+                    minWidth: "200px",
+                    padding: "15px 20px",
+                    background: topic.trim() && !loading 
+                      ? "linear-gradient(135deg, #667eea 0%, #764ba2 100%)" 
+                      : "#94a3b8",
                 color: "white",
                 border: "none",
                 borderRadius: "10px",
@@ -590,6 +750,145 @@ export default function QABlogUI() {
               <span style={{ fontWeight: "600", color: "#475569" }}>⚡ Quick Generate:</span> Instantly create a comprehensive blog post
             </p>
           </div>
+            </div>
+          )}
+
+          {/* YouTube Tab Content */}
+          {activeTab === "youtube" && (
+            <div>
+              <h3 style={{ 
+                fontSize: "18px", 
+                fontWeight: "600", 
+                color: "#1a202c", 
+                marginTop: "0",
+                marginBottom: "20px",
+                display: "flex",
+                alignItems: "center",
+                gap: "8px"
+              }}>
+                <span>🎥</span> Generate Blog from YouTube Video
+              </h3>
+              
+              <input
+                type="text"
+                placeholder="Paste YouTube video URL here (e.g., https://youtube.com/watch?v=...)"
+                value={youtubeUrl}
+                onChange={(e) => setYoutubeUrl(e.target.value)}
+                style={{ 
+                  width: "100%", 
+                  padding: "15px", 
+                  marginBottom: "15px", 
+                  border: "2px solid #e2e8f0",
+                  borderRadius: "10px",
+                  fontSize: "16px",
+                  fontFamily: "inherit",
+                  outline: "none",
+                  transition: "border-color 0.2s ease",
+                  backgroundColor: "#fafbfc"
+                }}
+                onFocus={(e) => e.target.style.borderColor = "#ff416c"}
+                onBlur={(e) => e.target.style.borderColor = "#e2e8f0"}
+              />
+              
+              <textarea
+                placeholder="Additional context (optional): Any specific aspects you want the blog to focus on..."
+                value={additionalContext}
+                onChange={(e) => setAdditionalContext(e.target.value)}
+                style={{ 
+                  width: "100%", 
+                  padding: "15px", 
+                  marginBottom: "20px", 
+                  border: "2px solid #e2e8f0",
+                  borderRadius: "10px",
+                  fontSize: "14px",
+                  fontFamily: "inherit",
+                  outline: "none",
+                  transition: "border-color 0.2s ease",
+                  backgroundColor: "#fafbfc",
+                  minHeight: "80px",
+                  resize: "vertical"
+                }}
+                onFocus={(e) => e.target.style.borderColor = "#ff416c"}
+                onBlur={(e) => e.target.style.borderColor = "#e2e8f0"}
+              />
+              
+              <button 
+                onClick={generateFromYoutube} 
+                disabled={loading || !youtubeUrl.trim()}
+                style={{
+                  width: "100%",
+                  padding: "15px 20px",
+                  background: youtubeUrl.trim() && !loading 
+                    ? "linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%)" 
+                    : "#94a3b8",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "10px",
+                  fontSize: "16px",
+                  fontWeight: "600",
+                  cursor: youtubeUrl.trim() && !loading ? "pointer" : "not-allowed",
+                  transition: "all 0.3s ease",
+                  boxShadow: youtubeUrl.trim() && !loading 
+                    ? "0 4px 15px rgba(255, 65, 108, 0.4)" 
+                    : "none",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: "8px"
+                }}
+                onMouseOver={(e) => {
+                  if (youtubeUrl.trim() && !loading) {
+                    e.target.style.transform = "translateY(-2px)";
+                    e.target.style.boxShadow = "0 6px 20px rgba(255, 65, 108, 0.6)";
+                  }
+                }}
+                onMouseOut={(e) => {
+                  e.target.style.transform = "translateY(0)";
+                  e.target.style.boxShadow = youtubeUrl.trim() && !loading 
+                    ? "0 4px 15px rgba(255, 65, 108, 0.4)" 
+                    : "none";
+                }}
+              >
+                {loading ? (
+                  <>
+                    <div style={{
+                      width: "18px",
+                      height: "18px",
+                      border: "2px solid rgba(255,255,255,0.3)",
+                      borderTopColor: "white",
+                      borderRadius: "50%",
+                      animation: "spin 1s linear infinite"
+                    }}></div>
+                    Processing Video...
+                  </>
+                ) : (
+                  <>
+                    <span>🎬</span>
+                    Generate Blog from Video
+                  </>
+                )}
+              </button>
+              
+              <div style={{ 
+                marginTop: "20px", 
+                padding: "15px", 
+                backgroundColor: "#fff5f5", 
+                borderRadius: "8px",
+                border: "1px solid #fecaca"
+              }}>
+                <p style={{ 
+                  margin: "0", 
+                  fontSize: "14px", 
+                  color: "#dc2626", 
+                  textAlign: "center",
+                  lineHeight: "1.5"
+                }}>
+                  <span style={{ fontWeight: "600" }}>🎥 YouTube Blog:</span> Extracts video transcript and generates comprehensive blog content<br/>
+                  <span style={{ fontWeight: "600" }}>📝 Note:</span> Video must have captions/subtitles available for best results
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
